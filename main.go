@@ -40,6 +40,7 @@ var (
 	metricsPath         = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 	persistenceFile     = flag.String("persistence.file", "", "File to persist metrics. If empty, metrics are only kept in memory.")
 	persistenceInterval = flag.Duration("persistence.interval", 5*time.Minute, "The minimum interval at which to write out the persistence file.")
+	timeToLive          = flag.Duration("metric.timetolive", 0, "The minimum interval at which to write out the persistence file.")
 )
 
 func init() {
@@ -61,7 +62,7 @@ func main() {
 	flag.VisitAll(func(f *flag.Flag) {
 		flags[f.Name] = f.Value.String()
 	})
-	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval)
+	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, *timeToLive)
 	prometheus.SetMetricFamilyInjectionHook(ms.GetMetricFamilies)
 	// Enable collect checks for debugging.
 	// prometheus.EnableCollectChecks(true)

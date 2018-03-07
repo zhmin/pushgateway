@@ -61,6 +61,7 @@ type mfStat struct {
 func NewDiskMetricStore(
 	persistenceFile string,
 	persistenceInterval time.Duration,
+	timeToLive time.Duration,
 ) *DiskMetricStore {
 	// TODO: Do that outside of the constructor to allow the HTTP server to
 	//  serve /-/healthy and /-/ready earlier.
@@ -80,6 +81,7 @@ func NewDiskMetricStore(
 	}
 
 	go dms.loop(persistenceInterval)
+	go dms.doCleanUpInReguarInterval(timeToLive)
 	return dms
 }
 
@@ -379,5 +381,34 @@ func copyMetricFamily(mf *dto.MetricFamily) *dto.MetricFamily {
 		Help:   mf.Help,
 		Type:   mf.Type,
 		Metric: append([]*dto.Metric{}, mf.Metric...),
+	}
+}
+
+func (dms *DiskMetricStore) doCleanUpInReguarInterval(timeToLive time.Duration) {
+	if timeToLive == 0 {
+		return
+	}
+	for {
+		dms.cleanupStaleValues(timeToLive)
+		timer1 := time.NewTimer(timeToLive)
+		<-timer1.C
+	}
+}
+
+func (dms *DiskMetricStore) cleanupStaleValues(timeToLive time.Duration) {
+	dms.lock.RLock()
+	defer dms.lock.RUnlock()
+
+	cleanupCycleStartTime := time.Now()
+
+	for metricID, group := range dms.metricGroups {
+		for metricName, tmf := range group.Metrics {
+			if tmf.Timestamp.Add(timeToLive).Before(cleanupCycleStartTime) {
+				delete(group.Metrics, metricName)
+			}
+		}
+		if len(group.Metrics) == 0 {
+			delete(dms.metricGroups, metricID)
+		}
 	}
 }
