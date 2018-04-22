@@ -6,7 +6,7 @@ exist long enough to be scraped, they can instead push their metrics
 to a Pushgateway. The Pushgateway then exposes these metrics to
 Prometheus.
 
-Additional to promethues pushgateway it address the issue prometheus/pushgateway#117
+Additionally to promethues pushgateway it address the issue [prometheus/pushgateway#117](https://github.com/prometheus/pushgateway/issues/117)
 
 ### Using Docker
 
