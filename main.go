@@ -14,33 +14,29 @@
 package main
 
 import (
-	"flag"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/elazarl/go-bindata-assetfs"
 	"github.com/julienschmidt/httprouter"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
+	"gopkg.in/alecthomas/kingpin.v2"
 
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/prometheus/pushgateway/asset"
 	"github.com/prometheus/pushgateway/handler"
 	"github.com/prometheus/pushgateway/storage"
-)
-
-var (
-	showVersion         = flag.Bool("version", false, "Print version information.")
-	listenAddress       = flag.String("web.listen-address", ":9091", "Address to listen on for the web interface, API, and telemetry.")
-	metricsPath         = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
-	persistenceFile     = flag.String("persistence.file", "", "File to persist metrics. If empty, metrics are only kept in memory.")
-	persistenceInterval = flag.Duration("persistence.interval", 5*time.Minute, "The minimum interval at which to write out the persistence file.")
-	timeToLive          = flag.Duration("metric.timetolive", 0, "The minimum interval at which to write out the persistence file.")
 )
 
 func init() {
@@ -48,59 +44,67 @@ func init() {
 }
 
 func main() {
-	flag.Parse()
+	var (
+		app = kingpin.New(filepath.Base(os.Args[0]), "The Pushgateway")
 
-	if *showVersion {
-		fmt.Fprintln(os.Stdout, version.Print("pushgateway"))
-		os.Exit(0)
+		listenAddress       = app.Flag("web.listen-address", "Address to listen on for the web interface, API, and telemetry.").Default(":9091").String()
+		metricsPath         = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		routePrefix         = app.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints.").Default("").String()
+		persistenceFile     = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
+		persistenceInterval = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
+		timeToLive          = app.Flag("metric.timetolive", "The minimum interval at which to write out the persistence file.").Default("0s").Duration()
+	)
+	log.AddFlags(app)
+	app.Version(version.Print("pushgateway"))
+	app.HelpFlag.Short('h')
+	kingpin.MustParse(app.Parse(os.Args[1:]))
+
+	if *routePrefix == "/" {
+		*routePrefix = ""
+	}
+	if *routePrefix != "" {
+		*routePrefix = "/" + strings.Trim(*routePrefix, "/")
 	}
 
 	log.Infoln("Starting pushgateway", version.Info())
 	log.Infoln("Build context", version.BuildContext())
+	log.Debugf("Prefix path is '%s'", *routePrefix)
 
 	flags := map[string]string{}
-	flag.VisitAll(func(f *flag.Flag) {
+	for _, f := range app.Model().Flags {
 		flags[f.Name] = f.Value.String()
-	})
-	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, *timeToLive)
-	prometheus.SetMetricFamilyInjectionHook(ms.GetMetricFamilies)
-	// Enable collect checks for debugging.
-	// prometheus.EnableCollectChecks(true)
+	}
+
+	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, *timeToLive)
+
+	// Inject the metric families returned by ms.GetMetricFamilies into the default Gatherer:
+	prometheus.DefaultGatherer = prometheus.Gatherers{
+		prometheus.DefaultGatherer,
+		prometheus.GathererFunc(func() ([]*dto.MetricFamily, error) { return ms.GetMetricFamilies(), nil }),
+	}
 
 	r := httprouter.New()
-	r.Handler("GET", "/-/healthy", prometheus.InstrumentHandlerFunc("healthy", handler.Healthy(ms)))
-	r.Handler("GET", "/-/ready", prometheus.InstrumentHandlerFunc("ready", handler.Ready(ms)))
-
-	r.Handler("GET", *metricsPath, prometheus.Handler())
+	r.Handler("GET", *routePrefix+"/-/healthy", handler.Healthy(ms))
+	r.Handler("GET", *routePrefix+"/-/ready", handler.Ready(ms))
+	r.Handler("GET", path.Join(*routePrefix, *metricsPath), promhttp.Handler())
 
 	// Handlers for pushing and deleting metrics.
-	r.PUT("/metrics/job/:job/*labels", handler.Push(ms, true))
-	r.POST("/metrics/job/:job/*labels", handler.Push(ms, false))
-	r.DELETE("/metrics/job/:job/*labels", handler.Delete(ms))
-	r.PUT("/metrics/job/:job", handler.Push(ms, true))
-	r.POST("/metrics/job/:job", handler.Push(ms, false))
-	r.DELETE("/metrics/job/:job", handler.Delete(ms))
+	pushAPIPath := *routePrefix + "/metrics"
+	r.PUT(pushAPIPath+"/job/:job/*labels", handler.Push(ms, true))
+	r.POST(pushAPIPath+"/job/:job/*labels", handler.Push(ms, false))
+	r.DELETE(pushAPIPath+"/job/:job/*labels", handler.Delete(ms))
+	r.PUT(pushAPIPath+"/job/:job", handler.Push(ms, true))
+	r.POST(pushAPIPath+"/job/:job", handler.Push(ms, false))
+	r.DELETE(pushAPIPath+"/job/:job", handler.Delete(ms))
 
-	// Handlers for the deprecated API.
-	r.PUT("/metrics/jobs/:job/instances/:instance", handler.LegacyPush(ms, true))
-	r.POST("/metrics/jobs/:job/instances/:instance", handler.LegacyPush(ms, false))
-	r.DELETE("/metrics/jobs/:job/instances/:instance", handler.LegacyDelete(ms))
-	r.PUT("/metrics/jobs/:job", handler.LegacyPush(ms, true))
-	r.POST("/metrics/jobs/:job", handler.LegacyPush(ms, false))
-	r.DELETE("/metrics/jobs/:job", handler.LegacyDelete(ms))
+	r.Handler("GET", *routePrefix+"/static/*filepath", handler.Static(asset.Assets))
 
-	r.Handler("GET", "/static/*filepath", prometheus.InstrumentHandler(
-		"static",
-		http.FileServer(
-			&assetfs.AssetFS{Asset: Asset, AssetDir: AssetDir, AssetInfo: AssetInfo},
-		),
-	))
-	statusHandler := prometheus.InstrumentHandlerFunc("status", handler.Status(ms, Asset, flags))
-	r.Handler("GET", "/status", statusHandler)
-	r.Handler("GET", "/", statusHandler)
+	statusHandler := handler.Status(ms, asset.Assets, flags)
+	r.Handler("GET", *routePrefix+"/status", statusHandler)
+	r.Handler("GET", *routePrefix+"/", statusHandler)
 
 	// Re-enable pprof.
-	r.GET("/debug/pprof/*pprof", handlePprof)
+	r.GET(*routePrefix+"/debug/pprof/*pprof", handlePprof)
 
 	log.Infof("Listening on %s.", *listenAddress)
 	l, err := net.Listen("tcp", *listenAddress)
@@ -133,7 +137,7 @@ func handlePprof(w http.ResponseWriter, r *http.Request, p httprouter.Params) {
 }
 
 func interruptHandler(l net.Listener) {
-	notifier := make(chan os.Signal)
+	notifier := make(chan os.Signal, 1)
 	signal.Notify(notifier, os.Interrupt, syscall.SIGTERM)
 	<-notifier
 	log.Info("Received SIGINT/SIGTERM; exiting gracefully...")

@@ -1,3 +1,49 @@
+## 0.7.0 / 2018-12-07
+
+_As preparation for the 1.0.0 release, this release removes the long deprecated
+legacy HTTP push endpoint (which uses `/jobs/` rather than `/job/` in the URL)._
+
+* [CHANGE] Remove legacy push API. #227
+* [ENHANCEMENT] Update dependencies. #230
+* [ENHANCEMENT] Support Go modules. #221
+* [BUGFIX] Avoid crash when started with v0.4 storage. #223
+
+## 0.6.0 / 2018-10-17
+
+_Persistence storage prior to 0.5.0 is unsupported. Upgrade to 0.5.2 first for
+conversion._
+
+* [CHANGE] Enforce consistency of help strings by changing them during
+  exposition. (An INFO-level log message describes the change.) #194
+* [CHANGE] Drop support of pre-0.5 storage format.
+* [CHANGE] Use prometheus/client_golang v0.9, which changes the `http_...`
+  metrics. (See README.md for full documentation of exposed metrics.)
+
+## 0.5.2 / 2018-06-15
+
+* [BUGFIX] Update client_golang/prometheus vendoring to allow inconsistent
+  labels. #185
+
+## 0.5.1 / 2018-05-30
+
+* [BUGFIX] Fix conversion of old persistency format (0.4.0 and earlier). #179
+* [BUGFIX] Make _Delete Group_ button work again. #177
+* [BUGFIX] Don't display useless flags on status page. #176
+
+## 0.5.0 / 2018-05-23
+
+Breaking change:
+* Flags now require double-dash.
+* The persistence storage format has been updated.  Upgrade is transparent, but downgrade to 0.4.0 and prior is unsupported.
+* Persistence storage prior to 0.1.0 is unsupported.
+
+* [CHANGE] Replaced Flags with Kingpin #152
+* [CHANGE] Slightly changed disk format for persistence. v0.5 can still read the pre-v0.5 format. #172
+* [ENHANCEMENT] Debug level logging now shows client-induced errors #123
+* [FEATURE] Add /-/ready and /-/healthy #135
+* [FEATURE] Add web.route-prefix flag #146
+* [BUGFIX] Fix incorrect persistence of certain values in a metric family. #172
+
 ## 0.4.0 / 2017-06-09
 * [CHANGE] Pushes with timestamps are now rejected.
 * [FEATURE] Added push_time_seconds metric to each push.

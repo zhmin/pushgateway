@@ -20,6 +20,7 @@ import (
 
 	"github.com/julienschmidt/httprouter"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 
 	"github.com/prometheus/pushgateway/storage"
@@ -32,9 +33,9 @@ func Delete(ms storage.MetricStore) func(http.ResponseWriter, *http.Request, htt
 	var ps httprouter.Params
 	var mtx sync.Mutex // Protects ps.
 
-	instrumentedHandlerFunc := prometheus.InstrumentHandlerFunc(
-		"delete",
-		func(w http.ResponseWriter, _ *http.Request) {
+	instrumentedHandler := promhttp.InstrumentHandlerCounter(
+		httpCnt.MustCurryWith(prometheus.Labels{"handler": "delete"}),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			job := ps.ByName("job")
 			labelsString := ps.ByName("labels")
 			mtx.Unlock()
@@ -56,50 +57,12 @@ func Delete(ms storage.MetricStore) func(http.ResponseWriter, *http.Request, htt
 				Timestamp: time.Now(),
 			})
 			w.WriteHeader(http.StatusAccepted)
-		},
-	)
-	return func(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
-		mtx.Lock()
-		ps = params
-		instrumentedHandlerFunc(w, r)
-	}
-}
-
-// LegacyDelete returns a handler that accepts delete requests. It deals with
-// the deprecated API.
-//
-// The returned handler is already instrumented for Prometheus.
-func LegacyDelete(ms storage.MetricStore) func(http.ResponseWriter, *http.Request, httprouter.Params) {
-	var ps httprouter.Params
-	var mtx sync.Mutex // Protects ps.
-
-	instrumentedHandlerFunc := prometheus.InstrumentHandlerFunc(
-		"delete",
-		func(w http.ResponseWriter, _ *http.Request) {
-			job := ps.ByName("job")
-			instance := ps.ByName("instance")
-			mtx.Unlock()
-
-			if job == "" {
-				http.Error(w, "job name is required", http.StatusBadRequest)
-				log.Debug("job name is required")
-				return
-			}
-			labels := map[string]string{"job": job}
-			if instance != "" {
-				labels["instance"] = instance
-			}
-			ms.SubmitWriteRequest(storage.WriteRequest{
-				Labels:    labels,
-				Timestamp: time.Now(),
-			})
-			w.WriteHeader(http.StatusAccepted)
-		},
+		}),
 	)
 
 	return func(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 		mtx.Lock()
 		ps = params
-		instrumentedHandlerFunc(w, r)
+		instrumentedHandler.ServeHTTP(w, r)
 	}
 }

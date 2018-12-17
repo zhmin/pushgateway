@@ -16,7 +16,6 @@ package storage
 import (
 	"encoding/gob"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
 
@@ -43,6 +43,7 @@ type DiskMetricStore struct {
 	done            chan error
 	metricGroups    GroupingKeyToMetricGroup
 	persistenceFile string
+	predefinedHelp  map[string]string
 }
 
 type mfStat struct {
@@ -51,16 +52,22 @@ type mfStat struct {
 }
 
 // NewDiskMetricStore returns a DiskMetricStore ready to use. To cleanly shut it
-// down and free resources, the Shutdown() method has to be called.  If
-// persistenceFile is the empty string, no persisting to disk will
+// down and free resources, the Shutdown() method has to be called.
+//
+// If persistenceFile is the empty string, no persisting to disk will
 // happen. Otherwise, a file of that name is used for persisting metrics to
 // disk. If the file already exists, metrics are read from it as part of the
 // start-up. Persisting is happening upon shutdown and after every write action,
 // but the latter will only happen persistenceDuration after the previous
 // persisting.
+//
+// If a non-nil Gatherer is provided, the help strings of metrics gathered by it
+// will be used as standard. Pushed metrics with deviating help strings will be
+// adjusted to avoid inconsistent expositions.
 func NewDiskMetricStore(
 	persistenceFile string,
 	persistenceInterval time.Duration,
+	gaptherPredefinedHelpFrom prometheus.Gatherer,
 	timeToLive time.Duration,
 ) *DiskMetricStore {
 	// TODO: Do that outside of the constructor to allow the HTTP server to
@@ -74,10 +81,11 @@ func NewDiskMetricStore(
 	}
 	if err := dms.restore(); err != nil {
 		log.Errorln("Could not load persisted metrics:", err)
-		log.Info("Retrying assuming legacy format for persisted metrics...")
-		if err := dms.legacyRestore(); err != nil {
-			log.Errorln("Could not load persisted metrics in legacy format: ", err)
-		}
+	}
+	if helpStrings, err := extractPredefinedHelpStrings(gaptherPredefinedHelpFrom); err == nil {
+		dms.predefinedHelp = helpStrings
+	} else {
+		log.Errorln("Could not gather metrics for predefined help strings:", err)
 	}
 
 	go dms.loop(persistenceInterval)
@@ -100,7 +108,11 @@ func (dms *DiskMetricStore) GetMetricFamilies() []*dto.MetricFamily {
 
 	for _, group := range dms.metricGroups {
 		for name, tmf := range group.Metrics {
-			mf := tmf.MetricFamily
+			mf := tmf.GetMetricFamily()
+			if mf == nil {
+				log.Warn("Storage corruption detected, consider wiping the persistence file.")
+				continue
+			}
 			stat, exists := mfStatByName[name]
 			if exists {
 				existingMF := result[stat.pos]
@@ -112,19 +124,28 @@ func (dms *DiskMetricStore) GetMetricFamilies() []*dto.MetricFamily {
 					existingMF = copyMetricFamily(existingMF)
 					result[stat.pos] = existingMF
 				}
-				if mf.GetHelp() != existingMF.GetHelp() || mf.GetType() != existingMF.GetType() {
+				if mf.GetHelp() != existingMF.GetHelp() {
 					log.Infof(
-						"Metric families '%s' and '%s' are inconsistent, help and type of the latter will have priority. This is bad. Fix your pushed metrics!",
+						"Metric families '%s' and '%s' have inconsistent help strings. The latter will have priority. This is bad. Fix your pushed metrics!",
 						mf, existingMF,
 					)
 				}
+				// Type inconsistency cannot be fixed here. We will detect it during
+				// gathering anyway, so no reason to log anything here.
 				for _, metric := range mf.Metric {
 					existingMF.Metric = append(existingMF.Metric, metric)
 				}
 			} else {
+				copied := false
+				if help, ok := dms.predefinedHelp[name]; ok && mf.GetHelp() != help {
+					log.Infof("Metric family '%s' has the same name as a metric family used by the Pushgateway itself but it has a different help string. Changing it to the standard help string %q. This is bad. Fix your pushed metrics!", mf, help)
+					mf = copyMetricFamily(mf)
+					copied = true
+					mf.Help = proto.String(help)
+				}
 				mfStatByName[name] = mfStat{
 					pos:    len(result),
-					copied: false,
+					copied: copied,
 				}
 				result = append(result, mf)
 			}
@@ -167,7 +188,7 @@ func (dms *DiskMetricStore) loop(persistenceInterval time.Duration) {
 	var persistTimer *time.Timer
 
 	checkPersist := func() {
-		if !persistScheduled && lastWrite.After(lastPersist) {
+		if dms.persistenceFile != "" && !persistScheduled && lastWrite.After(lastPersist) {
 			persistTimer = time.AfterFunc(
 				persistenceInterval-lastWrite.Sub(lastPersist),
 				func() {
@@ -237,8 +258,8 @@ func (dms *DiskMetricStore) processWriteRequest(wr WriteRequest) {
 			dms.metricGroups[key] = group
 		}
 		group.Metrics[name] = TimestampedMetricFamily{
-			Timestamp:    wr.Timestamp,
-			MetricFamily: mf,
+			Timestamp:            wr.Timestamp,
+			GobbableMetricFamily: (*GobbableMetricFamily)(mf),
 		}
 	}
 }
@@ -259,6 +280,8 @@ func (dms *DiskMetricStore) GetMetricFamiliesMap() GroupingKeyToMetricGroup {
 }
 
 func (dms *DiskMetricStore) persist() error {
+	// Check (again) if persistence is configured because some code paths
+	// will call this method even if it is not.
 	if dms.persistenceFile == "" {
 		return nil
 	}
@@ -300,79 +323,10 @@ func (dms *DiskMetricStore) restore() error {
 	}
 	defer f.Close()
 	d := gob.NewDecoder(f)
-	return d.Decode(&dms.metricGroups)
-}
-
-func (dms *DiskMetricStore) legacyRestore() error {
-	if dms.persistenceFile == "" {
-		return nil
-	}
-	f, err := os.Open(dms.persistenceFile)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
+	if err := d.Decode(&dms.metricGroups); err != nil {
 		return err
 	}
-	defer f.Close()
-
-	var tmf TimestampedMetricFamily
-	for d := gob.NewDecoder(f); err == nil; tmf, err = legacyReadTimestampedMetricFamily(d) {
-		if len(tmf.MetricFamily.GetMetric()) == 0 {
-			continue // No metric in this MetricFamily.
-		}
-		name := tmf.MetricFamily.GetName()
-		var job, instance string
-		for _, lp := range tmf.MetricFamily.GetMetric()[0].GetLabel() {
-			// With the way the pushgateway persists things, all
-			// metrics in a single MetricFamily proto message share
-			// the same job and instance label. So we only have to
-			// peek at the first metric to find it.
-			switch lp.GetName() {
-			case "job":
-				job = lp.GetValue()
-			case "instance":
-				instance = lp.GetValue()
-			}
-			if job != "" && instance != "" {
-				break
-			}
-		}
-		labels := map[string]string{
-			"job":      job,
-			"instance": instance,
-		}
-		key := model.LabelsToSignature(labels)
-		group, ok := dms.metricGroups[key]
-		if !ok {
-			group = MetricGroup{
-				Labels:  labels,
-				Metrics: NameToTimestampedMetricFamilyMap{},
-			}
-			dms.metricGroups[key] = group
-		}
-		group.Metrics[name] = tmf
-	}
-	if err == io.EOF {
-		return nil
-	}
-	return err
-}
-
-func legacyReadTimestampedMetricFamily(d *gob.Decoder) (TimestampedMetricFamily, error) {
-	var buffer []byte
-	if err := d.Decode(&buffer); err != nil {
-		return TimestampedMetricFamily{}, err
-	}
-	mf := &dto.MetricFamily{}
-	if err := proto.Unmarshal(buffer, mf); err != nil {
-		return TimestampedMetricFamily{}, err
-	}
-	var timestamp time.Time
-	if err := d.Decode(&timestamp); err != nil {
-		return TimestampedMetricFamily{}, err
-	}
-	return TimestampedMetricFamily{MetricFamily: mf, Timestamp: timestamp}, nil
+	return nil
 }
 
 func copyMetricFamily(mf *dto.MetricFamily) *dto.MetricFamily {
@@ -411,4 +365,20 @@ func (dms *DiskMetricStore) cleanupStaleValues(timeToLive time.Duration) {
 			delete(dms.metricGroups, metricID)
 		}
 	}
+}
+// extractPredefinedHelpStrings extracts all the HELP strings from the provided
+// gatherer so that the DiskMetricStore can fix deviations in pushed metrics.
+func extractPredefinedHelpStrings(g prometheus.Gatherer) (map[string]string, error) {
+	if g == nil {
+		return nil, nil
+	}
+	mfs, err := g.Gather()
+	if err != nil {
+		return nil, err
+	}
+	result := map[string]string{}
+	for _, mf := range mfs {
+		result[mf.GetName()] = mf.GetHelp()
+	}
+	return result, nil
 }

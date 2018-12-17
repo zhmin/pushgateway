@@ -17,11 +17,11 @@ For example:
 ```bash
 docker pull dmathai/prom-pushgateway-ttl:latest
 
-docker run -d -p 9091:9091 dmathai/prom-pushgateway-ttl:latest -metric.timetolive=60s
+docker run -d -p 9091:9091 dmathai/prom-pushgateway-ttl:latest --metric.timetolive=60s
 ```
 
 ## Use it
 
 ### Time To Live
-If we pass a argument `metric.timetolive` at the time of start up(Example : `-metric.timetolive=60s`), 
+If we pass a argument `metric.timetolive` at the time of start up(Example : `--metric.timetolive=60s`), 
 the metrics will be removed from pushgateway after the 'metric.timetolive' from the time of pushing the metric.
