@@ -25,3 +25,4 @@ docker run -d -p 9091:9091 dmathai/prom-pushgateway-ttl:latest --metric.timetoli
 ### Time To Live
 If we pass a argument `metric.timetolive` at the time of start up(Example : `--metric.timetolive=60s`), 
 the metrics will be removed from pushgateway after the 'metric.timetolive' from the time of pushing the metric.
+**The clean up jobs runs every 60 sec. So anything below 60 sec will not work.** 

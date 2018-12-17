@@ -344,7 +344,7 @@ func (dms *DiskMetricStore) doCleanUpInReguarInterval(timeToLive time.Duration) 
 	}
 	for {
 		dms.cleanupStaleValues(timeToLive)
-		timer1 := time.NewTimer(timeToLive)
+		timer1 := time.NewTimer(60 * time.Second)
 		<-timer1.C
 	}
 }
@@ -366,6 +366,7 @@ func (dms *DiskMetricStore) cleanupStaleValues(timeToLive time.Duration) {
 		}
 	}
 }
+
 // extractPredefinedHelpStrings extracts all the HELP strings from the provided
 // gatherer so that the DiskMetricStore can fix deviations in pushed metrics.
 func extractPredefinedHelpStrings(g prometheus.Gatherer) (map[string]string, error) {
