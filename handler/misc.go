@@ -17,8 +17,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/server"
 
 	"github.com/prometheus/pushgateway/storage"
 )
@@ -28,8 +27,8 @@ import (
 //
 // The returned handler is already instrumented for Prometheus.
 func Healthy(ms storage.MetricStore) http.Handler {
-	return promhttp.InstrumentHandlerCounter(
-		httpCnt.MustCurryWith(prometheus.Labels{"handler": "healthy"}),
+	return InstrumentWithCounter(
+		"healthy",
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			err := ms.Healthy()
 			if err == nil {
@@ -47,8 +46,8 @@ func Healthy(ms storage.MetricStore) http.Handler {
 //
 // The returned handler is already instrumented for Prometheus.
 func Ready(ms storage.MetricStore) http.Handler {
-	return promhttp.InstrumentHandlerCounter(
-		httpCnt.MustCurryWith(prometheus.Labels{"handler": "ready"}),
+	return InstrumentWithCounter(
+		"ready",
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			err := ms.Ready()
 			if err == nil {
@@ -63,9 +62,17 @@ func Ready(ms storage.MetricStore) http.Handler {
 // Static serves the static files from the provided http.FileSystem.
 //
 // The returned handler is already instrumented for Prometheus.
-func Static(root http.FileSystem) http.Handler {
-	return promhttp.InstrumentHandlerCounter(
-		httpCnt.MustCurryWith(prometheus.Labels{"handler": "static"}),
-		http.FileServer(root),
+func Static(root http.FileSystem, prefix string) http.Handler {
+	if prefix == "/" {
+		prefix = ""
+	}
+
+	handler := server.StaticFileServer(root)
+	return InstrumentWithCounter(
+		"static",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Path = r.URL.Path[len(prefix):]
+			handler.ServeHTTP(w, r)
+		}),
 	)
 }

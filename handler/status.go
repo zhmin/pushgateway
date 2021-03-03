@@ -14,6 +14,7 @@
 package handler
 
 import (
+	"encoding/base64"
 	"fmt"
 	"html"
 	"html/template"
@@ -22,11 +23,9 @@ import (
 	"strconv"
 	"time"
 
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/pushgateway/storage"
 )
@@ -36,6 +35,7 @@ type data struct {
 	Flags        map[string]string
 	BuildInfo    map[string]string
 	Birth        time.Time
+	PathPrefix   string
 	counter      int
 }
 
@@ -55,34 +55,43 @@ func Status(
 	ms storage.MetricStore,
 	root http.FileSystem,
 	flags map[string]string,
+	pathPrefix string,
+	logger log.Logger,
 ) http.Handler {
 	birth := time.Now()
-	return promhttp.InstrumentHandlerCounter(
-		httpCnt.MustCurryWith(prometheus.Labels{"handler": "status"}),
+	return InstrumentWithCounter(
+		"status",
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			t := template.New("status")
 			t.Funcs(template.FuncMap{
 				"value": func(f float64) string {
 					return strconv.FormatFloat(f, 'f', -1, 64)
 				},
+				"timeFormat": func(t time.Time) string {
+					return t.Format(time.RFC3339)
+				},
+				"base64": func(s string) string {
+					return base64.RawURLEncoding.EncodeToString([]byte(s))
+				},
 			})
+
 			f, err := root.Open("template.html")
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
-				log.Errorf("Error loading template.html, %v", err.Error())
+				level.Error(logger).Log("msg", "error loading template.html", "err", err.Error())
 				return
 			}
 			defer f.Close()
 			tpl, err := ioutil.ReadAll(f)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
-				log.Errorf("Error reading template.html, %v", err.Error())
+				level.Error(logger).Log("msg", "error reading template.html", "err", err.Error())
 				return
 			}
 			_, err = t.Parse(string(tpl))
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
-				log.Errorf("Error parsing template, %v", err.Error())
+				level.Error(logger).Log("msg", "error parsing template", "err", err.Error())
 				return
 			}
 
@@ -99,15 +108,8 @@ func Status(
 				MetricGroups: ms.GetMetricFamiliesMap(),
 				BuildInfo:    buildInfo,
 				Birth:        birth,
-			}
-			d.Flags = map[string]string{}
-			// Exclude kingpin default flags to expose only Prometheus ones.
-			boilerplateFlags := kingpin.New("", "").Version("")
-			for name, value := range flags {
-				if boilerplateFlags.GetFlag(name) != nil {
-					continue
-				}
-				d.Flags[name] = value
+				PathPrefix:   pathPrefix,
+				Flags:        flags,
 			}
 
 			err = t.Execute(w, d)

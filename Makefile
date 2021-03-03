@@ -11,15 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-include Makefile.common
+# Needs to be defined before including Makefile.common to auto-generate targets
+DOCKER_ARCHS ?= amd64 armv7 arm64 ppc64le
 
-STATICCHECK_IGNORE = \
-  github.com/prometheus/pushgateway/handler/delete.go:SA1019 \
-  github.com/prometheus/pushgateway/handler/push.go:SA1019 \
-  github.com/prometheus/pushgateway/main.go:SA1019
+include Makefile.common
 
 DOCKER_IMAGE_NAME ?= pushgateway
 
 assets:
 	@echo ">> writing assets"
-	@cd $(PREFIX)/asset && $(GO) generate && $(GOFMT) -w assets_vfsdata.go
+	@cd $(PREFIX)/asset && GO111MODULE=$(GO111MODULE) $(GO) generate && $(GOFMT) -w assets_vfsdata.go

@@ -14,23 +14,22 @@
 package handler
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/julienschmidt/httprouter"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/matttproud/golang_protobuf_extensions/pbutil"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/expfmt"
-	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/route"
 
 	dto "github.com/prometheus/client_model/go"
 
@@ -38,45 +37,51 @@ import (
 )
 
 const (
-	pushMetricName = "push_time_seconds"
-	pushMetricHelp = "Last Unix time when this group was changed in the Pushgateway."
+	// Base64Suffix is appended to a label name in the request URL path to
+	// mark the following label value as base64 encoded.
+	Base64Suffix = "@base64"
 )
 
 // Push returns an http.Handler which accepts samples over HTTP and stores them
 // in the MetricStore. If replace is true, all metrics for the job and instance
-// given by the request are deleted before new ones are stored.
+// given by the request are deleted before new ones are stored. If check is
+// true, the pushed metrics are immediately checked for consistency (with
+// existing metrics and themselves), and an inconsistent push is rejected with
+// http.StatusBadRequest.
 //
 // The returned handler is already instrumented for Prometheus.
 func Push(
-	ms storage.MetricStore, replace bool,
-) func(http.ResponseWriter, *http.Request, httprouter.Params) {
-	var ps httprouter.Params
+	ms storage.MetricStore,
+	replace, check, jobBase64Encoded bool,
+	logger log.Logger,
+) func(http.ResponseWriter, *http.Request) {
 	var mtx sync.Mutex // Protects ps.
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		job := ps.ByName("job")
-		labelsString := ps.ByName("labels")
+		job := route.Param(r.Context(), "job")
+		if jobBase64Encoded {
+			var err error
+			if job, err = decodeBase64(job); err != nil {
+				http.Error(w, fmt.Sprintf("invalid base64 encoding in job name %q: %v", job, err), http.StatusBadRequest)
+				level.Debug(logger).Log("msg", "invalid base64 encoding in job name", "job", job, "err", err.Error())
+				return
+			}
+		}
+		labelsString := route.Param(r.Context(), "labels")
 		mtx.Unlock()
 
 		labels, err := splitLabels(labelsString)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
-			log.Debugf("Failed to parse URL: %v, %v", labelsString, err.Error())
+			level.Debug(logger).Log("msg", "failed to parse URL", "url", labelsString, "err", err.Error())
 			return
 		}
 		if job == "" {
 			http.Error(w, "job name is required", http.StatusBadRequest)
-			log.Debug("job name is required")
+			level.Debug(logger).Log("msg", "job name is required")
 			return
 		}
 		labels["job"] = job
-
-		if replace {
-			ms.SubmitWriteRequest(storage.WriteRequest{
-				Labels:    labels,
-				Timestamp: time.Now(),
-			})
-		}
 
 		var metricFamilies map[string]*dto.MetricFamily
 		ctMediatype, ctParams, ctErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -103,92 +108,68 @@ func Push(
 		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
-			log.Debugf("Failed to parse text, %v", err.Error())
-			return
-		}
-		if timestampsPresent(metricFamilies) {
-			http.Error(w, "pushed metrics must not have timestamps", http.StatusBadRequest)
-			log.Debug("pushed metrics must not have timestamps")
+			level.Debug(logger).Log("msg", "failed to parse text", "source", r.RemoteAddr, "err", err.Error())
 			return
 		}
 		now := time.Now()
-		addPushTimestamp(metricFamilies, now)
-		sanitizeLabels(metricFamilies, labels)
+		if !check {
+			ms.SubmitWriteRequest(storage.WriteRequest{
+				Labels:         labels,
+				Timestamp:      now,
+				MetricFamilies: metricFamilies,
+				Replace:        replace,
+			})
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		errCh := make(chan error, 1)
+		errReceived := false
 		ms.SubmitWriteRequest(storage.WriteRequest{
 			Labels:         labels,
 			Timestamp:      now,
 			MetricFamilies: metricFamilies,
+			Replace:        replace,
+			Done:           errCh,
 		})
-		w.WriteHeader(http.StatusAccepted)
+		for err := range errCh {
+			// Send only first error via HTTP, but log all of them.
+			// TODO(beorn): Consider sending all errors once we
+			// have a use case. (Currently, at most one error is
+			// produced.)
+			if !errReceived {
+				http.Error(
+					w,
+					fmt.Sprintf("pushed metrics are invalid or inconsistent with existing metrics: %v", err),
+					http.StatusBadRequest,
+				)
+			}
+			level.Error(logger).Log(
+				"msg", "pushed metrics are invalid or inconsistent with existing metrics",
+				"method", r.Method,
+				"source", r.RemoteAddr,
+				"err", err.Error(),
+			)
+			errReceived = true
+		}
 	})
 
 	instrumentedHandler := promhttp.InstrumentHandlerRequestSize(
 		httpPushSize, promhttp.InstrumentHandlerDuration(
-			httpPushDuration, promhttp.InstrumentHandlerCounter(
-				httpCnt.MustCurryWith(prometheus.Labels{"handler": "push"}),
-				handler,
-			)))
+			httpPushDuration, InstrumentWithCounter("push", handler),
+		))
 
-	return func(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
+	return func(w http.ResponseWriter, r *http.Request) {
 		mtx.Lock()
-		ps = params
 		instrumentedHandler.ServeHTTP(w, r)
 	}
 }
 
-// sanitizeLabels ensures that all the labels in groupingLabels and the
-// `instance` label are present in each MetricFamily in metricFamilies. The
-// label values from groupingLabels are set in each MetricFamily, no matter
-// what. After that, if the 'instance' label is not present at all in a
-// MetricFamily, it will be created (with an empty string as value).
-//
-// Finally, sanitizeLabels sorts the label pairs of all metrics.
-func sanitizeLabels(
-	metricFamilies map[string]*dto.MetricFamily,
-	groupingLabels map[string]string,
-) {
-	gLabelsNotYetDone := make(map[string]string, len(groupingLabels))
-
-	for _, mf := range metricFamilies {
-	metric:
-		for _, m := range mf.GetMetric() {
-			for ln, lv := range groupingLabels {
-				gLabelsNotYetDone[ln] = lv
-			}
-			hasInstanceLabel := false
-			for _, lp := range m.GetLabel() {
-				ln := lp.GetName()
-				if lv, ok := gLabelsNotYetDone[ln]; ok {
-					lp.Value = proto.String(lv)
-					delete(gLabelsNotYetDone, ln)
-				}
-				if ln == string(model.InstanceLabel) {
-					hasInstanceLabel = true
-				}
-				if len(gLabelsNotYetDone) == 0 && hasInstanceLabel {
-					sort.Sort(labelPairs(m.Label))
-					continue metric
-				}
-			}
-			for ln, lv := range gLabelsNotYetDone {
-				m.Label = append(m.Label, &dto.LabelPair{
-					Name:  proto.String(ln),
-					Value: proto.String(lv),
-				})
-				if ln == string(model.InstanceLabel) {
-					hasInstanceLabel = true
-				}
-				delete(gLabelsNotYetDone, ln) // To prepare map for next metric.
-			}
-			if !hasInstanceLabel {
-				m.Label = append(m.Label, &dto.LabelPair{
-					Name:  proto.String(string(model.InstanceLabel)),
-					Value: proto.String(""),
-				})
-			}
-			sort.Sort(labelPairs(m.Label))
-		}
-	}
+// decodeBase64 decodes the provided string using the “Base 64 Encoding with URL
+// and Filename Safe Alphabet” (RFC 4648). Padding characters (i.e. trailing
+// '=') are ignored.
+func decodeBase64(s string) (string, error) {
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	return string(b), err
 }
 
 // splitLabels splits a labels string into a label map mapping names to values.
@@ -203,55 +184,21 @@ func splitLabels(labels string) (map[string]string, error) {
 	}
 
 	for i := 0; i < len(components)-1; i += 2 {
-		if !model.LabelNameRE.MatchString(components[i]) ||
-			strings.HasPrefix(components[i], model.ReservedLabelPrefix) {
-			return nil, fmt.Errorf("improper label name %q", components[i])
+		name, value := components[i], components[i+1]
+		trimmedName := strings.TrimSuffix(name, Base64Suffix)
+		if !model.LabelNameRE.MatchString(trimmedName) ||
+			strings.HasPrefix(trimmedName, model.ReservedLabelPrefix) {
+			return nil, fmt.Errorf("improper label name %q", trimmedName)
 		}
-		result[components[i]] = components[i+1]
+		if name == trimmedName {
+			result[name] = value
+			continue
+		}
+		decodedValue, err := decodeBase64(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 encoding for label %s=%q: %v", trimmedName, value, err)
+		}
+		result[trimmedName] = decodedValue
 	}
 	return result, nil
-}
-
-// Checks if any timestamps have been specified.
-func timestampsPresent(metricFamilies map[string]*dto.MetricFamily) bool {
-	for _, mf := range metricFamilies {
-		for _, m := range mf.GetMetric() {
-			if m.TimestampMs != nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// Add metric to indicate the push time.
-func addPushTimestamp(metricFamilies map[string]*dto.MetricFamily, t time.Time) {
-	metricFamilies[pushMetricName] = &dto.MetricFamily{
-		Name: proto.String(pushMetricName),
-		Help: proto.String(pushMetricHelp),
-		Type: dto.MetricType_GAUGE.Enum(),
-		Metric: []*dto.Metric{
-			{
-				Gauge: &dto.Gauge{
-					Value: proto.Float64(float64(t.UnixNano()) / 1e9),
-				},
-			},
-		},
-	}
-}
-
-// labelPairs implements sort.Interface. It provides a sortable version of a
-// slice of dto.LabelPair pointers.
-type labelPairs []*dto.LabelPair
-
-func (s labelPairs) Len() int {
-	return len(s)
-}
-
-func (s labelPairs) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-func (s labelPairs) Less(i, j int) bool {
-	return s[i].GetName() < s[j].GetName()
 }
