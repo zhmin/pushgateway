@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -471,7 +472,9 @@ func (dms *DiskMetricStore) cleanupStaleValues(timeToLive time.Duration) {
 
 	for metricID, group := range dms.metricGroups {
 		for metricName, tmf := range group.Metrics {
-			if tmf.Timestamp.Add(timeToLive).Before(cleanupCycleStartTime) {
+			help := tmf.GetMetricFamily().GetHelp()
+			ttl := getTTL(help) //if the help has TTL，expired use ttl
+			if ttl > 0 && tmf.Timestamp.Add(ttl).Before(cleanupCycleStartTime) {
 				delete(group.Metrics, metricName)
 			}
 		}
@@ -479,6 +482,19 @@ func (dms *DiskMetricStore) cleanupStaleValues(timeToLive time.Duration) {
 			delete(dms.metricGroups, metricID)
 		}
 	}
+}
+
+func getTTL(help string) time.Duration {
+	var ttl time.Duration
+	ttl = 0
+	ttlbegin := strings.Index(help, "##@TTL-")
+	ttlend := strings.Index(help, "@##")
+	if ttlbegin >= 0 && ttlend >= 0 {
+		ttlstr := string([]rune(help)[ttlbegin+7 : ttlend])
+		ttlInt, _ := strconv.Atoi(ttlstr)
+		ttl = time.Duration(ttlInt) * time.Second
+	}
+	return ttl
 }
 
 // groupingKeyFor creates a grouping key from the provided map of grouping

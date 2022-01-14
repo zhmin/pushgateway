@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -130,24 +132,42 @@ type metrics struct {
 func (api *API) metrics(w http.ResponseWriter, r *http.Request) {
 	familyMaps := api.MetricStore.GetMetricFamiliesMap()
 	res := []interface{}{}
+	cleanupCycleStartTime := time.Now()
 	for _, v := range familyMaps {
 		metricResponse := map[string]interface{}{}
 		metricResponse["labels"] = v.Labels
 		metricResponse["last_push_successful"] = v.LastPushSuccess()
 		for name, metricValues := range v.Metrics {
 			metricFamily := metricValues.GetMetricFamily()
-			uniqueMetrics := metrics{
-				Type:      metricFamily.GetType().String(),
-				Help:      metricFamily.GetHelp(),
-				Timestamp: metricValues.Timestamp,
-				Metrics:   makeEncodableMetrics(metricFamily.GetMetric(), metricFamily.GetType()),
+			help := metricFamily.GetHelp()
+			ttl := getTTL(help)
+			if ttl <= 0 || metricValues.Timestamp.Add(ttl).After(cleanupCycleStartTime) {
+				uniqueMetrics := metrics{
+					Type:      metricFamily.GetType().String(),
+					Help:      metricFamily.GetHelp(),
+					Timestamp: metricValues.Timestamp,
+					Metrics:   makeEncodableMetrics(metricFamily.GetMetric(), metricFamily.GetType()),
+				}
+				metricResponse[name] = uniqueMetrics
 			}
-			metricResponse[name] = uniqueMetrics
 		}
 		res = append(res, metricResponse)
 	}
 
 	api.respond(w, res)
+}
+
+func getTTL(help string) time.Duration {
+	var ttl time.Duration
+	ttl = 0
+	ttlbegin := strings.Index(help, "##@TTL-")
+	ttlend := strings.Index(help, "@##")
+	if ttlbegin >= 0 && ttlend >= 0 {
+		ttlstr := string([]rune(help)[ttlbegin+7 : ttlend])
+		ttlInt, _ := strconv.Atoi(ttlstr)
+		ttl = time.Duration(ttlInt) * time.Second
+	}
+	return ttl
 }
 
 func (api *API) status(w http.ResponseWriter, r *http.Request) {
